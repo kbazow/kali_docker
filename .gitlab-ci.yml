@@ -1,0 +1,145 @@
+
+variables:
+    BASE_IMAGES: 'kali-rolling kali-dev kali-last-release'
+    EXTRA_IMAGES: 'kali-experimental kali-bleeding-edge kali'
+    ARCHS: 'amd64 arm64 armhf'
+
+stages:
+    - build
+    - register
+    - test
+    - push
+
+build-rootfs:
+    stage: build
+    image: debian:testing
+    artifacts:
+        paths:
+            - "*.tar.xz"
+            - "*.release.version"
+    script: |
+        set -e
+        # Install tools
+        apt-get -y update
+        apt-get -y install debootstrap pixz qemu-user-static wget
+        # Install Kali archive keyring
+        KEYRING_PKG_URL=$(wget -nv -O - \
+            https://http.kali.org/kali/dists/kali-rolling/main/binary-amd64/Packages.gz \
+            | gzip -dc | grep ^Filename: | grep kali-archive-keyring | head -n 1 | awk '{print $2}')
+        KEYRING_PKG_URL="https://http.kali.org/kali/$KEYRING_PKG_URL"
+        wget -nv "$KEYRING_PKG_URL"
+        dpkg -i kali-archive-keyring_*_all.deb
+        rm kali-archive-keyring_*_all.deb
+        # Enable support for additional executable binary formats
+        update-binfmts --enable
+        # Take a look at the surroundings
+        echo "================================"
+        PS4=====\ $\ ; set -x
+        uname -a
+        cat /proc/cmdline
+        sh -c "cut -d ' ' -f 1 /proc/modules | sort -u"
+        ls -l /dev
+        cat /proc/mounts
+        zgrep BINFMT_MISC /proc/config.gz
+        sh -c "update-binfmts --display | sed -n 's/:$//p'"
+        set +x
+        echo "================================"
+        # Test architectures right away
+        echo "Arch test:"
+        for arch in $ARCHS; do
+            echo -n "* $arch: " && /usr/lib/arch-test/$arch
+        done
+        # Since GitLab migrated to Google Container-Optimized OS & Docker 19.03.15
+        # in August 2021, /builds is mounted with the option nodev, and it breaks
+        # debootstrap. Workaround by using another location.
+        # References:
+        # * https://gitlab.com/kalilinux/build-scripts/kali-docker/-/issues/40
+        # * https://gitlab.com/gitlab-com/gl-infra/production/-/issues/5184
+        mkdir /work && cp build-rootfs.sh /work && cd /work
+        # Build the various rootfs
+        for image in $BASE_IMAGES; do
+            for arch in $ARCHS; do
+                echo "========================================"
+                echo "Building rootfs $image/$arch"
+                echo "========================================"
+                ./build-rootfs.sh "$image" "$arch"
+            done
+        done
+        # Bring artifacts back in CI_PROJECT_DIR (see above)
+        cp -v *.tar.xz *.release.version $CI_PROJECT_DIR
+
+build-docker-images:
+    stage: register
+    image: docker:latest
+    services:
+        - docker:dind
+    dependencies:
+        - build-rootfs
+    artifacts:
+        paths:
+            - "*.conf"
+    script: |
+        set -e
+        apk update
+        apk add bash
+        docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+        echo "$CI_JOB_TOKEN" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+        for image in $BASE_IMAGES; do
+            for arch in $ARCHS; do
+                ./docker-build.sh "$image" "$arch"
+            done
+        done
+        for image in $EXTRA_IMAGES; do
+            for arch in $ARCHS; do
+                ./docker-build-extra.sh "$image" "$arch"
+            done
+        done
+
+test-docker-images:
+    stage: test
+    image: docker:latest
+    services:
+        - docker:dind
+    dependencies:
+        - build-docker-images
+    script: |
+        set -e
+        apk update
+        apk add bash
+        docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+        for image in $BASE_IMAGES $EXTRA_IMAGES; do
+            for arch in $ARCHS; do
+                ./docker-test.sh "$image" "$arch"
+            done
+        done
+
+push-docker-images:
+    stage: push
+    image: docker:latest
+    services:
+        - docker:dind
+    dependencies:
+        - build-docker-images
+    script: |
+        set -e
+        apk update
+        apk add bash
+        echo "$CI_JOB_TOKEN" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+        if [ -n "$DOCKER_HUB_ACCESS_TOKEN" ]; then
+            echo "$DOCKER_HUB_ACCESS_TOKEN" | docker login -u "$DOCKER_HUB_USER" --password-stdin
+        fi
+        for image in $BASE_IMAGES $EXTRA_IMAGES; do
+            for arch in $ARCHS; do
+                ./docker-push.sh "$image" "$arch"
+            done
+        done
+        for image in $BASE_IMAGES $EXTRA_IMAGES; do
+            ./docker-push-manifest.sh "$image" "$ARCHS"
+        done
+        # Clean tags
+        #apk add curl jq gawk
+        #for image in $BASE_IMAGES $EXTRA_IMAGES; do
+        #    for arch in $ARCHS; do
+        #        ./docker-cleanup.sh "$image" "$arch"
+        #    done
+        #done
